@@ -100,12 +100,17 @@ export function hashContent(text: string): string {
 interface Span { text: string; start: number; end: number }
 
 function tokenize(value: string): string[] {
-	return [...new Set(value.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 3))];
+	const lowered = value.toLowerCase();
+	const words = lowered.split(/[^a-z0-9]+/).filter((term) => term.length > 3);
+	const versions = lowered.match(/\d+(?:\.\d+)+/g) ?? [];
+	return [...new Set([...words, ...versions])];
 }
 
 function extractRelevantSpans(content: string, hint: string): Span[] {
 	const sentences: Span[] = [];
-	const sentencePattern = /[^.!?]+(?:[.!?]+(?=\s|$)|$)/g;
+	// Break at line ends and at . ! ? followed by whitespace, so dotted names
+	// such as "asyncio.TaskGroup" and "3.11" stay inside their sentence.
+	const sentencePattern = /(?:[^.!?\n]|[.!?](?!\s|$))+[.!?]*/g;
 	for (const match of content.matchAll(sentencePattern)) {
 		const raw = match[0];
 		const text = raw.trim();
@@ -116,10 +121,17 @@ function extractRelevantSpans(content: string, hint: string): Span[] {
 	}
 	const terms = tokenize(hint);
 	if (terms.length === 0) return [];
+	const lowered = sentences.map((sentence) => sentence.text.toLowerCase());
+	// Rank every sentence on the page by claim-term overlap; rarer terms break ties.
+	const frequency = new Map(terms.map((term) => [term, lowered.filter((text) => text.includes(term)).length]));
 	return sentences
-		.map((sentence, index) => ({ sentence, index, score: terms.filter((term) => sentence.text.toLowerCase().includes(term)).length }))
+		.map((sentence, index) => {
+			const matched = terms.filter((term) => lowered[index].includes(term));
+			const rarity = matched.reduce((sum, term) => sum + 1 / (frequency.get(term) ?? 1), 0);
+			return { sentence, index, score: matched.length, rarity };
+		})
 		.filter((item) => item.score > 0)
-		.sort((a, b) => b.score - a.score || a.index - b.index)
+		.sort((a, b) => b.score - a.score || b.rarity - a.rarity || a.index - b.index)
 		.slice(0, 3)
 		.map(({ sentence }) => sentence);
 }
@@ -143,7 +155,8 @@ export function buildPassages(sources: ResearchSource[], fetched: ExtractedConte
 		}
 		const page = fetchedByUrl.get(source.url);
 		if (page && !page.error && page.content) {
-			const passageHint = source.snippet?.trim() || hint;
+			// Match page text against the claim; the provider snippet is only a fallback.
+			const passageHint = hint.trim() || source.snippet?.trim() || "";
 			for (const [index, span] of extractRelevantSpans(page.content, passageHint).entries()) {
 				passages.push({
 					passage_id: passageId(source.rank, index + 1),

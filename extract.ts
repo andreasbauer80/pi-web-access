@@ -295,14 +295,75 @@ function abortedResult(url: string): ExtractedContent {
 let turndownInstance: Promise<TurndownService> | undefined;
 async function loadTurndown(): Promise<TurndownService> {
 	const { default: TurndownService } = await import("turndown");
-	return new TurndownService({
+	const turndown = new TurndownService({
 		headingStyle: "atx",
 		codeBlockStyle: "fenced",
 	});
+	// Turndown fences only <pre><code>. Docs sites (e.g. Sphinx) emit <pre><span>...,
+	// which would otherwise become escaped paragraph text. Fence it verbatim.
+	turndown.addRule("preWithoutCode", {
+		filter: (node) => node.nodeName === "PRE" && node.firstChild?.nodeName !== "CODE",
+		replacement: (_content, node) => {
+			const code = (node.textContent ?? "").replace(/\n$/, "");
+			const longestTicks = Math.max(0, ...Array.from(code.matchAll(/`+/g), (match) => match[0].length));
+			const fence = "`".repeat(Math.max(3, longestTicks + 1));
+			return `\n\n${fence}\n${code}\n${fence}\n\n`;
+		},
+	});
+	return turndown;
 }
 function getTurndown(): Promise<TurndownService> {
 	turndownInstance ??= loadTurndown();
 	return turndownInstance;
+}
+
+// URL #fragment support: find the target element's heading text in the original
+// DOM, then find the Markdown line with the same text.
+function urlFragmentId(url: string): string | null {
+	let hash: string;
+	try {
+		hash = new URL(url).hash.slice(1);
+	} catch {
+		return null;
+	}
+	if (!hash) return null;
+	try {
+		return decodeURIComponent(hash);
+	} catch {
+		return hash;
+	}
+}
+
+function compactAnchorText(text: string): string {
+	return text
+		.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/^\s*#+\s*/, "")
+		.replace(/\\(.)/g, "$1")
+		.replace(/[*_`¶]/g, "")
+		.replace(/\s+/g, "")
+		.toLowerCase()
+		.slice(0, 80);
+}
+
+function fragmentAnchorKey(document: Document, id: string): string | null {
+	const target = Array.from(document.querySelectorAll("[id],[name]"))
+		.find((element) => element.getAttribute("id") === id || element.getAttribute("name") === id);
+	if (!target) return null;
+	const anchor = target.closest("h1,h2,h3,h4,h5,h6")
+		?? target.querySelector("h1,h2,h3,h4,h5,h6")
+		?? target;
+	return compactAnchorText(anchor.textContent ?? "") || null;
+}
+
+function findAnchorOffset(markdown: string, key: string): number | undefined {
+	for (const headingsOnly of [true, false]) {
+		let offset = 0;
+		for (const line of markdown.split("\n")) {
+			if ((!headingsOnly || line.startsWith("#")) && compactAnchorText(line) === key) return offset;
+			offset += line.length + 1;
+		}
+	}
+	return undefined;
 }
 
 const fetchLimit = pLimit(CONCURRENT_LIMIT);
@@ -326,6 +387,8 @@ export interface ExtractedContent {
 	duration?: number;
 	mimeType?: string;
 	status?: number;
+	/** Set for HTML pages fetched with a URL #fragment; offset is absent when the target was not found. */
+	fragment?: { id: string; offset?: number };
 }
 
 type HttpExtractedContent = ExtractedContent & { declaredLinks?: DeclaredWebLink[] };
@@ -1319,6 +1382,14 @@ async function extractViaHttp(
 		const { parseHTML } = await import("linkedom");
 		const { document } = parseHTML(text);
 		const documentTitle = document.title?.trim() ?? "";
+		// Resolve the #fragment before Readability mutates the DOM.
+		const fragmentId = urlFragmentId(url);
+		const fragmentKey = fragmentId ? fragmentAnchorKey(document as unknown as Document, fragmentId) : null;
+		const fragmentOf = (content: string): Pick<ExtractedContent, "fragment"> => {
+			if (!fragmentId) return {};
+			const offset = fragmentKey ? findAnchorOffset(content, fragmentKey) : undefined;
+			return { fragment: offset === undefined ? { id: fragmentId } : { id: fragmentId, offset } };
+		};
 		const declaredLinks = discoverDeclaredWebLinks(
 			document as unknown as Document,
 			response.headers.get("link"),
@@ -1337,6 +1408,7 @@ async function extractViaHttp(
 					title: rscResult.title,
 					content: appendDeclaredWebLinks(rscResult.content, declaredLinks),
 					error: null,
+					...fragmentOf(rscResult.content),
 					declaredLinks,
 				};
 			}
@@ -1350,6 +1422,7 @@ async function extractViaHttp(
 					title: documentTitle || defuddleResult.title,
 					content: appendDeclaredWebLinks(defuddleResult.content, declaredLinks),
 					error: null,
+					...fragmentOf(defuddleResult.content),
 					declaredLinks,
 				};
 			}
@@ -1383,6 +1456,7 @@ async function extractViaHttp(
 					title: rscResult.title,
 					content: appendDeclaredWebLinks(rscResult.content, declaredLinks),
 					error: null,
+					...fragmentOf(rscResult.content),
 					declaredLinks,
 				};
 			}
@@ -1395,6 +1469,7 @@ async function extractViaHttp(
 					title: article.title || documentTitle || defuddleResult.title,
 					content: appendDeclaredWebLinks(defuddleResult.content, declaredLinks),
 					error: null,
+					...fragmentOf(defuddleResult.content),
 					declaredLinks,
 				};
 			}
@@ -1414,6 +1489,7 @@ async function extractViaHttp(
 			title: article.title || documentTitle,
 			content: appendDeclaredWebLinks(markdown, declaredLinks),
 			error: null,
+			...fragmentOf(markdown),
 			declaredLinks,
 		};
 	} catch (err) {
@@ -1461,6 +1537,12 @@ export async function fetchAllContent(
 	return results.map((result, index) => {
 		if (!result.content) return result;
 		const sanitized = sanitizeInlineDataUris(result.content, `urls[${index}].content`);
-		return sanitized.omissions.length > 0 ? { ...result, content: sanitized.text } : result;
+		if (sanitized.omissions.length === 0) return result;
+		// Fragment offsets point at a line start; data URIs never span lines, so
+		// the sanitized prefix length is the new offset.
+		const fragment = result.fragment?.offset === undefined
+			? result.fragment
+			: { ...result.fragment, offset: sanitizeInlineDataUris(result.content.slice(0, result.fragment.offset), `urls[${index}].content`).text.length };
+		return { ...result, content: sanitized.text, ...(fragment ? { fragment } : {}) };
 	});
 }

@@ -218,3 +218,20 @@ test("registered source_check validates the claim at runtime", async () => {
   const response = await tool.execute("call", { claim: "   " });
   assert.equal(response.details.error, "Missing claim");
 });
+
+test("page passages rank claim-matching sentences from deep in the page first, not the page intro", () => {
+  const intro = "This article explains the new features in Python 3.11, compared to 3.10. Python 3.11 is faster than Python 3.10.\n\n";
+  const filler = "Unrelated section text about the interpreter and its build options. ".repeat(200);
+  const target = "Added the asyncio.TaskGroup class, an asynchronous context manager holding a group of tasks.";
+  const content = `${intro}${filler}\n\n* ${target}\n\nMore unrelated tail text.`;
+  const artifact = buildResearchArtifact({
+    query: "asyncio.TaskGroup was added in Python 3.11",
+    results: [result("https://docs.python.org/3/whatsnew/3.11.html", "This article explains the new features in Python 3.11, compared to 3.10.")],
+    fetched: [{ url: "https://docs.python.org/3/whatsnew/3.11.html", title: "What's New", content, error: null }],
+  });
+  const pagePassages = artifact.passages.filter((passage) => passage.extraction_span);
+  assert.ok(pagePassages.length > 0);
+  assert.equal(pagePassages[0].text, `* ${target}`);
+  assert.ok(pagePassages[0].extraction_span.start > 10_000);
+  assert.equal(content.slice(pagePassages[0].extraction_span.start, pagePassages[0].extraction_span.end), pagePassages[0].text);
+});
