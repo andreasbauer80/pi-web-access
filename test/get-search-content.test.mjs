@@ -255,6 +255,37 @@ test("get_search_content returns small fetched content without continuation nois
 	assert.doesNotMatch(text, /Showing chars/);
 });
 
+test("get_search_content defaults to the only URL when no selector is given", async () => {
+	const tool = getContentTool();
+	storeFetchedContent("only page content");
+
+	const result = await tool.execute("call", { responseId: "large-fetch" });
+
+	assert.equal(result.details.error, undefined, result.content[0].text);
+	assert.equal(result.details.url, "https://example.com/large");
+	assert.match(result.content[0].text, /only page content/);
+});
+
+test("get_search_content still requires a selector when the responseId has several URLs", async () => {
+	const tool = getContentTool();
+	storeResult("multi-fetch", {
+		id: "multi-fetch",
+		type: "fetch",
+		timestamp: Date.now(),
+		urls: [
+			{ url: "https://example.com/one", title: "One", content: "first page", error: null },
+			{ url: "https://example.com/two", title: "Two", content: "second page", error: null },
+		],
+	});
+
+	const result = await tool.execute("call", { responseId: "multi-fetch" });
+
+	assert.equal(result.details.error, "No URL specified");
+	assert.match(result.content[0].text, /Specify url or urlIndex/);
+	assert.match(result.content[0].text, /0: https:\/\/example\.com\/one/);
+	assert.match(result.content[0].text, /1: https:\/\/example\.com\/two/);
+});
+
 test("get_search_content finds bounded passages in stored fetched content", async () => {
 	const tool = getContentTool();
 	storeFetchedContent(`prefix ${"A".repeat(2_000)} Installation requires Node 22. ${"B".repeat(2_000)} suffix`);

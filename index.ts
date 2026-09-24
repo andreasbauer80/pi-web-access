@@ -15,11 +15,12 @@ export type { ProviderAvailability } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
 import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath, resolveCuratorNetworkConfig, runWithProxy } from "./utils.ts";
 import {
-	clearResults,
 	deleteResult,
 	generateId,
 	getAllResults,
 	getResult,
+	getSessionOwnerId,
+	releaseSessionResults,
 	restoreFromSession,
 	storeFetchedContentResult,
 	storeResult,
@@ -81,7 +82,6 @@ import { registerCuratorRunLifecycle, resolveWebSearchWorkflow, type WebSearchWo
 import {
 	buildResearchArtifact,
 	withClaimAssessment,
-	storeResearchArtifact,
 	getResearchArtifact,
 	type RecencyFilter,
 	type ResearchArtifact,
@@ -587,8 +587,8 @@ function resolveProvider(
 	return provider;
 }
 
-const pendingFetches = new Map<string, AbortController>();
-let sessionActive = false;
+// Module state is shared by every session in the process; each fetch records its session.
+const pendingFetches = new Map<string, { controller: AbortController; sessionId: string | undefined }>();
 let widgetVisible = false;
 let widgetUnsubscribe: (() => void) | null = null;
 const pendingCurates = new Map<string, PendingCurate>();
@@ -641,9 +641,9 @@ function stripThumbnails(results: ExtractedContent[]): ExtractedContent[] {
 	return results.map(({ thumbnail, frames, ...rest }) => rest);
 }
 
-function storeFetchResult(pi: { appendEntry(type: string, data: unknown): void }, responseId: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }, authProfile?: AuthFetchProfile): boolean {
+function storeFetchResult(pi: { appendEntry(type: string, data: unknown): void }, responseId: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }, authProfile?: AuthFetchProfile, sessionId?: string): boolean {
 	if (authProfile?.cache === "off") return false;
-	pi.appendEntry("web-search-results", storeFetchedContentResult(responseId, data));
+	pi.appendEntry("web-search-results", storeFetchedContentResult(responseId, data, sessionId));
 	return true;
 }
 
@@ -812,11 +812,12 @@ function boundSearchPresentation(
 	};
 }
 
-function abortPendingFetches(): void {
-	for (const controller of pendingFetches.values()) {
-		controller.abort();
+function abortPendingFetches(sessionId: string): void {
+	for (const [fetchId, pending] of pendingFetches) {
+		if (pending.sessionId !== sessionId) continue;
+		pending.controller.abort();
+		pendingFetches.delete(fetchId);
 	}
-	pendingFetches.clear();
 }
 
 function closeCurator(callId?: string): void {
@@ -1050,10 +1051,9 @@ function formatEntryLine(
 }
 
 function handleSessionChange(ctx: ExtensionContext): void {
-	abortPendingFetches();
+	abortPendingFetches(getSessionOwnerId(ctx));
 	closeCurator();
 	clearCloneCache();
-	sessionActive = true;
 	restoreFromSession(ctx);
 	// Unsubscribe before clear() to avoid callback with stale ctx
 	widgetUnsubscribe?.();
@@ -1105,23 +1105,25 @@ export default function (pi: ExtensionAPI) {
 		.join("; ");
 	const curateKey = initConfig.shortcuts?.curate || DEFAULT_SHORTCUTS.curate;
 	const activityKey = initConfig.shortcuts?.activity || DEFAULT_SHORTCUTS.activity;
+	// Session that owns this extension instance; set on session_start.
+	let sessionId: string | undefined;
 
 	function startBackgroundFetch(urls: string[], proxy?: string): string | null {
 		if (urls.length === 0) return null;
 		const fetchId = generateId();
 		const controller = new AbortController();
-		pendingFetches.set(fetchId, controller);
+		pendingFetches.set(fetchId, { controller, sessionId });
 		Promise.resolve()
 			.then(() => runWithProxy(proxy, () => fetchAllContent(urls, controller.signal, withRegisteredFetchOptions(undefined, registeredToolNames, proxy))))
 			.then((fetched) => {
-				if (!sessionActive || !pendingFetches.has(fetchId)) return;
+				if (!pendingFetches.has(fetchId)) return;
 				const data = {
 					id: fetchId,
 					type: "fetch",
 					timestamp: Date.now(),
 					urls: stripThumbnails(fetched),
 				} satisfies StoredSearchData & { type: "fetch"; urls: ExtractedContent[] };
-				pi.appendEntry("web-search-results", storeFetchedContentResult(fetchId, data));
+				pi.appendEntry("web-search-results", storeFetchedContentResult(fetchId, data, sessionId));
 				const ok = fetched.filter(f => !f.error).length;
 				const availability = ok === fetched.length
 					? "Full page content now available."
@@ -1138,7 +1140,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			})
 			.catch((err) => {
-				if (!sessionActive || !pendingFetches.has(fetchId)) return;
+				if (!pendingFetches.has(fetchId)) return;
 				const message = err instanceof Error ? err.message : String(err);
 				const isAbort = (err instanceof Error && err.name === "AbortError") || message.toLowerCase().includes("abort");
 				if (!isAbort) {
@@ -1161,7 +1163,7 @@ export default function (pi: ExtensionAPI) {
 		const data: StoredSearchData = {
 			id, type: "search", timestamp: Date.now(), queries: results,
 		};
-		storeResult(id, data);
+		storeResult(id, data, sessionId);
 		pi.appendEntry("web-search-results", data);
 		return id;
 	}
@@ -1433,7 +1435,7 @@ export default function (pi: ExtensionAPI) {
 				timestamp: Date.now(),
 				urls: opts.inlineContent,
 			} satisfies StoredSearchData & { type: "fetch"; urls: ExtractedContent[] };
-			pi.appendEntry("web-search-results", storeFetchedContentResult(fetchId, data));
+			pi.appendEntry("web-search-results", storeFetchedContentResult(fetchId, data, sessionId));
 		} else if (opts.includeContent) {
 			fetchId = startBackgroundFetch(opts.urls, opts.proxy);
 		}
@@ -1813,15 +1815,18 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => handleSessionChange(ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		sessionId = getSessionOwnerId(ctx);
+		handleSessionChange(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => handleSessionChange(ctx));
 
-	pi.on("session_shutdown", () => {
-		sessionActive = false;
-		abortPendingFetches();
+	pi.on("session_shutdown", (_event, ctx) => {
+		const endingSessionId = getSessionOwnerId(ctx);
+		abortPendingFetches(endingSessionId);
 		closeCurator();
 		clearCloneCache();
-		clearResults();
+		releaseSessionResults(endingSessionId);
 		// Unsubscribe before clear() to avoid callback with stale ctx
 		widgetUnsubscribe?.();
 		widgetUnsubscribe = null;
@@ -2514,13 +2519,14 @@ export default function (pi: ExtensionAPI) {
 					domainFilter,
 				}), [claim]);
 				if (errors.length > 0) artifact.errors = errors;
-				storeResearchArtifact(artifact);
-				pi.appendEntry("web-search-results", {
+				const researchEntry: StoredSearchData = {
 					id: artifact.id,
 					type: "research",
 					timestamp: artifact.timestamp,
 					artifact,
-				});
+				};
+				storeResult(artifact.id, researchEntry, sessionId);
+				pi.appendEntry("web-search-results", researchEntry);
 				return {
 					content: [{ type: "text", text: formatSourceCheckResult(artifact, getSearchContentEnabled ? toolNames.getSearchContent : null) }],
 					details: { responseId: artifact.id, artifact, sourceCount: artifact.sources.length, passageCount: artifact.passages.length },
@@ -2660,7 +2666,7 @@ export default function (pi: ExtensionAPI) {
 					timestamp: Date.now(),
 					urls: stripThumbnails(fetchResults),
 				} satisfies StoredSearchData & { type: "fetch"; urls: ExtractedContent[] };
-				const storedContent = storeFetchResult(pi, responseId, data, authFetchProfile);
+				const storedContent = storeFetchResult(pi, responseId, data, authFetchProfile, sessionId);
 
 				if (urlList.length === 1) {
 					const result = presentedResults[0];
@@ -2918,7 +2924,7 @@ export default function (pi: ExtensionAPI) {
 			const data = getResult(params.responseId);
 			if (!data) {
 				return {
-					content: [{ type: "text", text: `Error: No stored results for responseId ${formatInputValue(params.responseId)}. Use a responseId returned by ${storedContentSources}.` }],
+					content: [{ type: "text", text: `Error: responseId ${formatInputValue(params.responseId)} is no longer in memory (for example after a session reload or restart). Run ${storedContentSources} again to get a new responseId.` }],
 					details: { error: "Not found", responseId: params.responseId },
 				};
 			}
@@ -3105,6 +3111,9 @@ export default function (pi: ExtensionAPI) {
 							details: { error: "Index out of range" },
 						};
 					}
+				} else if (data.urls.length === 1) {
+					selectedUrlIndex = 0;
+					urlData = data.urls[0];
 				} else {
 					const available = data.urls.map((u, i) => `${i}: ${u.url}`).join("\n  ");
 					return {

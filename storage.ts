@@ -67,7 +67,21 @@ export interface StoredSearchData {
 	fetchCacheError?: string;
 }
 
+// The extension module is shared by every session in one process, so each
+// entry records which sessions stored or restored it.
 const storedResults = new Map<string, StoredSearchData>();
+const resultOwners = new Map<string, Set<string>>();
+
+export function getSessionOwnerId(ctx: ExtensionContext | undefined): string {
+	return ctx?.sessionManager?.getSessionId?.() ?? "";
+}
+
+function addOwner(id: string, sessionId: string | undefined): void {
+	if (sessionId === undefined) return;
+	const owners = resultOwners.get(id) ?? new Set<string>();
+	owners.add(sessionId);
+	resultOwners.set(id, owners);
+}
 
 export function generateId(): string {
 	return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -441,11 +455,12 @@ export function pruneExpiredFetchCache(now = Date.now(), requestedLimits?: Parti
 	try { pruneFetchCache(now, limits); } catch {}
 }
 
-export function storeResult(id: string, data: StoredSearchData): void {
+export function storeResult(id: string, data: StoredSearchData, sessionId?: string): void {
 	storedResults.set(id, data);
+	addOwner(id, sessionId);
 }
 
-export function storeFetchedContentResult(id: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }): StoredSearchData {
+export function storeFetchedContentResult(id: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }, sessionId?: string): StoredSearchData {
 	pruneExpiredFetchedResults(Date.now());
 	let ref: FetchCacheRef | null = null;
 	let cacheError: string | undefined;
@@ -455,12 +470,33 @@ export function storeFetchedContentResult(id: string, data: StoredSearchData & {
 		cacheError = cacheWriteError(err);
 	}
 	storedResults.set(id, ref ? { ...data, fetchCache: ref, urlMetadata: metadataForUrls(data.urls) } : { ...data, fetchCacheError: cacheError });
+	addOwner(id, sessionId);
 	return createFetchSessionData(data, ref, cacheError);
+}
+
+// Rebuilds a fetch result from the on-disk cache after its memory entry is gone.
+function readFetchCacheById(id: string, now = Date.now()): StoredSearchData | null {
+	if (!CACHE_ID_PATTERN.test(id)) return null;
+	const path = fetchCachePath(cacheKeyForId(id));
+	if (!path) return null;
+	let fd: number | null = null;
+	try {
+		if (!safeFetchCacheDir(false)) return null;
+		fd = openRegularFile(path).fd;
+		enforceFileMode(fd);
+		const parsed: unknown = JSON.parse(readFileSync(fd, "utf8"));
+		if (!isValidStoredData(parsed) || parsed.type !== "fetch" || parsed.id !== id || !isInlineFetchData(parsed)) return null;
+		return now - parsed.timestamp < CACHE_TTL_MS ? parsed : null;
+	} catch {
+		return null;
+	} finally {
+		if (fd !== null) try { closeSync(fd); } catch {}
+	}
 }
 
 export function getResult(id: string): StoredSearchData | null {
 	const data = storedResults.get(id);
-	if (!data) return null;
+	if (!data) return readFetchCacheById(id);
 	const loaded = readCachedFetchData(data);
 	if (loaded !== data) storedResults.set(id, loaded);
 	return loaded;
@@ -484,11 +520,23 @@ export function deleteResult(id: string): boolean {
 			}
 		} catch {}
 	}
+	resultOwners.delete(id);
 	return storedResults.delete(id);
 }
 
 export function clearResults(): void {
 	storedResults.clear();
+	resultOwners.clear();
+}
+
+// Drops this session's claim on its results. Results that another session
+// still owns stay in memory.
+export function releaseSessionResults(sessionId: string): void {
+	for (const [id, owners] of resultOwners) {
+		if (!owners.delete(sessionId) || owners.size > 0) continue;
+		resultOwners.delete(id);
+		storedResults.delete(id);
+	}
 }
 
 function isValidStoredData(data: unknown): data is StoredSearchData {
@@ -508,7 +556,8 @@ function isValidStoredData(data: unknown): data is StoredSearchData {
 }
 
 export function restoreFromSession(ctx: ExtensionContext): void {
-	storedResults.clear();
+	const sessionId = getSessionOwnerId(ctx);
+	releaseSessionResults(sessionId);
 	const now = Date.now();
 	pruneExpiredFetchCache(now);
 
@@ -516,7 +565,9 @@ export function restoreFromSession(ctx: ExtensionContext): void {
 		if (entry.type === "custom" && entry.customType === "web-search-results") {
 			const data = entry.data;
 			if (isValidStoredData(data) && now - data.timestamp < CACHE_TTL_MS) {
-				storedResults.set(data.id, data);
+				// Keep the copy another session already holds; it may carry inline content.
+				if (!storedResults.has(data.id)) storedResults.set(data.id, data);
+				addOwner(data.id, sessionId);
 			}
 		}
 	}

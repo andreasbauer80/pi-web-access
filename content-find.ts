@@ -75,6 +75,13 @@ function fuzzyMatches(text: string, query: string): Match[] {
 	return matches;
 }
 
+// Collapses a whitespace run in an excerpt. A run with a line break keeps one
+// break and the next line's indentation, so code snippets stay multi-line.
+function collapseWhitespace(run: string): string {
+	const lastBreak = run.lastIndexOf("\n");
+	return lastBreak < 0 ? " " : `\n${run.slice(lastBreak + 1)}`;
+}
+
 function mergeRanges(ranges: Range[]): Range[] {
 	const merged: Range[] = [];
 	for (const range of [...ranges].sort((left, right) => left.start - right.start || left.end - right.end)) {
@@ -138,11 +145,11 @@ export function findContent(
 		id: `Q${index + 1}`,
 		order: index,
 	}));
-	const whitespaceRuns = [...text.matchAll(/\s+/g)].map(run => ({ start: run.index, end: run.index + run[0].length }));
+	const whitespaceRuns = [...text.matchAll(/\s+/g)].map(run => ({ start: run.index, end: run.index + run[0].length, saved: run[0].length - collapseWhitespace(run[0]).length }));
 	const whitespaceStarts = whitespaceRuns.map(run => run.start);
 	const whitespaceEnds = whitespaceRuns.map(run => run.end);
 	const whitespaceSavings = [0];
-	for (const run of whitespaceRuns) whitespaceSavings.push(whitespaceSavings.at(-1)! + run.end - run.start - 1);
+	for (const run of whitespaceRuns) whitespaceSavings.push(whitespaceSavings.at(-1)! + run.saved);
 	function normalizedLength(start: number, end: number): number {
 		const firstRun = upperBound(whitespaceStarts, start) - 1;
 		if (firstRun >= 0 && whitespaceEnds[firstRun] > start) start = whitespaceEnds[firstRun];
@@ -195,7 +202,7 @@ export function findContent(
 			if (contained.length === 0) continue;
 			const prefix = range.start > 0 ? "…" : "";
 			const suffix = range.end < text.length ? "…" : "";
-			const snippet = `${prefix}${text.slice(range.start, range.end).replace(/\s+/g, " ").trim()}${suffix}`;
+			const snippet = `${prefix}${text.slice(range.start, range.end).replace(/\s+/g, collapseWhitespace).trim()}${suffix}`;
 			const counts = contained
 				.map(result => `${overflow ? result.id : `\"${result.query}\"`} ×${result.count}`)
 				.join(", ");

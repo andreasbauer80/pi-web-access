@@ -175,3 +175,13 @@ test("findContent does not repeat context when bounded ranges split", () => {
 	}
 	assert.ok(result.text.length <= 20_000);
 });
+
+test("findContent keeps line breaks and indentation in code passages", () => {
+	const code = "function greet(name) {\n\tconst message = `Hello ${name}`;\n\treturn message;\n}";
+	const text = `Intro text.\n\n${code}\n\nOutro   text.`;
+	const result = findContent(text, ["const message"], "exact");
+
+	assert.equal(result.matchCount, 1);
+	assert.ok(result.text.includes(code), result.text);
+	assert.doesNotMatch(result.text, /Outro {3}text/);
+});
