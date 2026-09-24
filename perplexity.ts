@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { stripTrailingOffer } from "./search-answer-formatting.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
@@ -192,18 +193,25 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 		throw new Error(`Perplexity API returned invalid JSON: ${message}`);
 	}
 
-	const answer = (data.choices as Array<{ message?: { content?: string } }>)?.[0]?.message?.content || "";
+	const answer = stripTrailingOffer((data.choices as Array<{ message?: { content?: string } }>)?.[0]?.message?.content || "");
 	const citations = Array.isArray(data.citations) ? data.citations : [];
+	// search_results carries page titles for the URLs listed in citations.
+	const titlesByUrl = new Map<string, string>();
+	for (const item of Array.isArray(data.search_results) ? data.search_results : []) {
+		if (item && typeof item.url === "string" && typeof item.title === "string" && item.title.trim()) {
+			titlesByUrl.set(item.url, item.title.trim());
+		}
+	}
 
 	const results: SearchResult[] = [];
 	const citationCount = citationsToKeep(answer, citations.length, numResults);
 	for (let i = 0; i < citationCount; i++) {
 		const citation = citations[i];
 		if (typeof citation === "string") {
-			results.push({ title: `Source ${i + 1}`, url: citation, snippet: "" });
+			results.push({ title: titlesByUrl.get(citation) ?? `Source ${i + 1}`, url: citation, snippet: "" });
 		} else if (citation && typeof citation === "object" && typeof citation.url === "string") {
 			results.push({
-				title: citation.title || `Source ${i + 1}`,
+				title: citation.title || titlesByUrl.get(citation.url) || `Source ${i + 1}`,
 				url: citation.url,
 				snippet: "",
 			});

@@ -647,7 +647,7 @@ function storeFetchResult(pi: { appendEntry(type: string, data: unknown): void }
 	return true;
 }
 
-function initialContentSlice(content: string, maxChars: number): {
+function initialContentSlice(content: string, maxChars: number, start = 0): {
 	text: string;
 	endOffset: number;
 	totalBytes: number;
@@ -655,12 +655,12 @@ function initialContentSlice(content: string, maxChars: number): {
 	shownBytes: number;
 	shownLines: number;
 } {
-	let endOffset = Math.min(content.length, maxChars);
+	let endOffset = Math.min(content.length, start + maxChars);
 	if (endOffset < content.length) {
 		const lineBreak = content.lastIndexOf("\n", endOffset);
-		if (lineBreak >= Math.floor(maxChars * 0.8)) endOffset = lineBreak + 1;
+		if (lineBreak >= start + Math.floor(maxChars * 0.8)) endOffset = lineBreak + 1;
 	}
-	const text = content.slice(0, endOffset);
+	const text = content.slice(start, endOffset);
 	return {
 		text,
 		endOffset,
@@ -2678,15 +2678,25 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					const fullLength = result.content.length;
-					const slice = initialContentSlice(result.content, getMaxInlineContentChars());
-					const truncated = slice.endOffset < fullLength;
-					let output = slice.text;
+					const maxInline = getMaxInlineContentChars();
+					// A URL #fragment moves the inline preview only when the page is cut.
+					const fragment = fullLength > maxInline ? result.fragment : undefined;
+					const start = fragment?.offset ?? 0;
+					const slice = initialContentSlice(result.content, maxInline, start);
+					const truncated = start > 0 || slice.endOffset < fullLength;
+					let output = fragment
+						? fragment.offset === undefined
+							? `[#${fragment.id} not found in extracted text; showing the page start.]\n\n`
+							: `[Starting at #${fragment.id} (offset ${start} of ${fullLength})${storedContent ? "; full page stored" : ""}.]\n\n`
+						: "";
+					output += slice.text;
 
 					if (truncated) {
-						output += `\n\n---\nShowing ${slice.endOffset} of ${fullLength} chars, ${slice.shownBytes} of ${slice.totalBytes} bytes, and ${slice.shownLines} of ${slice.totalLines} lines. `;
+						const nextOffset = slice.endOffset < fullLength ? slice.endOffset : 0;
+						output += `\n\n---\nShowing ${slice.text.length} of ${fullLength} chars, ${slice.shownBytes} of ${slice.totalBytes} bytes, and ${slice.shownLines} of ${slice.totalLines} lines. `;
 						output += storedContent
 							? getSearchContentEnabled
-								? `Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${slice.endOffset} }) for the next slice.`
+								? `Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${nextOffset} }) for ${nextOffset === 0 ? "the page start" : "the next slice"}.`
 								: "Content retrieval is not registered."
 							: "Authenticated fetch cache is off; repeat the fetch to read more.";
 					}
