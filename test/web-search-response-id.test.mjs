@@ -9,7 +9,7 @@ const indexUrl = new URL("../index.ts", import.meta.url).href;
 
 // web_search and get_search_content are exercised through the real tool
 // objects in a child process with an isolated config dir and a mocked fetch.
-function runWebSearchThenRetrieve(config) {
+function runWebSearchThenRetrieve(config, args = { query: "response id", provider: "openai", workflow: "none" }) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-web-access-response-id-"));
 	try {
 		writeFileSync(join(dir, "web-search.json"), JSON.stringify(config));
@@ -34,14 +34,13 @@ function runWebSearchThenRetrieve(config) {
 			initializeExtension(pi);
 			await handlers.get("session_start")({}, { sessionManager: { getBranch: () => [] } });
 			const search = tools.find((t) => t.name === "web_search");
-			const result = await search.execute("t", { query: "response id", provider: "openai", workflow: "none" });
+			const result = await search.execute("t", ${JSON.stringify(args)});
 			const text = result.content[0].text;
 			const retrieve = tools.find((t) => t.name === "get_search_content");
 			let retrieved = null;
-			if (retrieve) {
-				const id = text.match(/responseId "([^"]+)"/)[1];
-				const r = await retrieve.execute("t2", { responseId: id, queryIndex: 0 });
-				retrieved = { isError: r.isError ?? false, text: r.content[0].text };
+			if (retrieve && !result.details.error) {
+				const r = await retrieve.execute("t2", { responseId: result.details.responseId, queryIndex: 0 });
+				retrieved = { isError: r.isError ?? false, details: r.details, text: r.content[0].text };
 			}
 			console.log(JSON.stringify({ text, details: result.details, searchId: result.details.searchId, retrieved, hasRetrieveTool: Boolean(retrieve) }));
 			`,
@@ -57,7 +56,6 @@ function runWebSearchThenRetrieve(config) {
 }
 
 test("web_search output tells the model the responseId that get_search_content accepts", () => {
-	// Parse the id out of the human-readable output, exactly as a model would.
 	const out = runWebSearchThenRetrieve({ provider: "openai" });
 	assert.ok(out.hasRetrieveTool);
 	assert.match(out.text, /Full search results are stored as responseId "[a-z0-9]+"\. Use get_search_content\(\{ responseId: "[a-z0-9]+", queryIndex: 0, offset: 0, limit: 30000 \}\)/);
@@ -65,9 +63,13 @@ test("web_search output tells the model the responseId that get_search_content a
 	assert.deepEqual(out.details.queryProviders, [{ query: "response id", providers: ["openai"] }]);
 	assert.equal(out.details.truncated, false);
 	assert.equal(out.details.omittedChars, 0);
-	assert.equal(out.text.match(/responseId "([^"]+)"/)[1], out.searchId, "printed id must be the stored searchId");
+	assert.equal(typeof out.details.responseId, "string");
+	assert.ok(out.details.responseId.length > 0);
+	assert.equal(out.details.responseId, out.details.searchId, "retain the searchId alias");
+	assert.equal(out.text.match(/responseId "([^"]+)"/)[1], out.details.responseId, "printed id must be the stored responseId");
 	assert.equal(out.retrieved.isError, false, out.retrieved.text);
-	assert.match(out.retrieved.text, /Search answer|example\.com\/source/);
+	assert.equal(out.retrieved.details.error, undefined, out.retrieved.text);
+	assert.match(out.retrieved.text, /Search answer/);
 });
 
 test("web_search output honours a renamed get_search_content tool", () => {
@@ -80,5 +82,15 @@ test("web_search output omits the retrieval hint when get_search_content is disa
 	const out = runWebSearchThenRetrieve({ provider: "openai", tools: { getSearchContent: { enabled: false } } });
 	assert.equal(out.hasRetrieveTool, false);
 	assert.doesNotMatch(out.text, /responseId/);
-	assert.ok(out.searchId, "results are still stored in details");
+	assert.equal(typeof out.details.responseId, "string", "results still expose a responseId in details");
+	assert.ok(out.details.responseId.length > 0);
+	assert.equal(out.details.responseId, out.details.searchId, "retain the searchId alias");
+});
+
+test("web_search early validation errors do not expose stored IDs", () => {
+	const out = runWebSearchThenRetrieve({ provider: "openai" }, {});
+	assert.equal(out.details.error, "No query provided");
+	assert.equal(Object.hasOwn(out.details, "responseId"), false);
+	assert.equal(Object.hasOwn(out.details, "searchId"), false);
+	assert.equal(out.retrieved, null);
 });

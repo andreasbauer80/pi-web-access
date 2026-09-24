@@ -97,7 +97,16 @@ function runIncludeContentScenario(mode) {
 			initializeExtension(pi);
 			await handlers.get("session_start")({}, { sessionManager: { getBranch: () => [] } });
 			const result = await tools.find(tool => tool.name === "web_search").execute("call", { query: "content guidance", includeContent: true });
-			console.log(JSON.stringify({ text: result.content[0].text, details: result.details }));
+			const retrieve = tools.find(tool => tool.name === "get_search_content");
+			const searchPage = await retrieve.execute("search-page", { responseId: result.details.responseId, queryIndex: 0 });
+			const fetchPage = ${JSON.stringify(mode)} === "inline"
+				? await retrieve.execute("fetch-page", { responseId: result.details.fetchId, urlIndex: 0 })
+				: null;
+			console.log(JSON.stringify({
+				text: result.content[0].text, details: result.details,
+				searchPage: { text: searchPage.content[0].text, details: searchPage.details },
+				fetchPage: fetchPage && { text: fetchPage.content[0].text, details: fetchPage.details },
+			}));
 			`,
 			encoding: "utf8",
 			timeout: 30_000,
@@ -188,6 +197,15 @@ test("truncated inline-ready search retains fetch and search retrieval guidance"
 	assert.match(out.text, new RegExp(`get_search_content\\(\\{ responseId: "${out.details.fetchId}", urlIndex: 0, offset: 0, limit: 1000 \\}\\)`));
 	assert.match(out.text, new RegExp(`Full search results are stored as responseId "${out.details.searchId}"`));
 	assert.match(out.text, new RegExp(`get_search_content\\(\\{ responseId: "${out.details.searchId}", queryIndex: 0, offset: 0, limit: 1000 \\}\\)`));
+	assert.equal(typeof out.details.responseId, "string");
+	assert.ok(out.details.responseId.length > 0);
+	assert.equal(out.details.responseId, out.details.searchId);
+	assert.equal(typeof out.details.fetchId, "string");
+	assert.notEqual(out.details.responseId, out.details.fetchId, "fetchId holds page content, not search results");
+	assert.equal(out.searchPage.details.error, undefined, out.searchPage.text);
+	assert.match(out.searchPage.text, /A{32}/, "the search responseId retrieves the provider answer");
+	assert.equal(out.fetchPage.details.error, undefined, out.fetchPage.text);
+	assert.match(out.fetchPage.text, /full inline page/);
 });
 
 test("truncated background-fetch search retains state, fetchId, and search retrieval guidance", () => {
@@ -197,4 +215,8 @@ test("truncated background-fetch search retains state, fetchId, and search retri
 	assert.match(out.text, /Will notify when ready/);
 	assert.match(out.text, new RegExp(`Full search results are stored as responseId "${out.details.searchId}"`));
 	assert.match(out.text, new RegExp(`get_search_content\\(\\{ responseId: "${out.details.searchId}", queryIndex: 0, offset: 0, limit: 1000 \\}\\)`));
+	assert.equal(out.details.responseId, out.details.searchId);
+	assert.notEqual(out.details.responseId, out.details.fetchId);
+	assert.equal(out.searchPage.details.error, undefined, out.searchPage.text);
+	assert.match(out.searchPage.text, /A{32}/);
 });

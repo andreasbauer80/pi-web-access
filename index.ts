@@ -1492,6 +1492,7 @@ export default function (pi: ExtensionAPI) {
 				fetchId,
 				fetchUrls: isBackgroundFetch ? opts.urls : undefined,
 				searchId,
+				responseId: searchId,
 				queryProviders: opts.results.map(result => ({
 					query: result.query,
 					providers: result.providers ?? (result.provider ? [result.provider] : []),

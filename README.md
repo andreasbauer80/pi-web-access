@@ -190,7 +190,7 @@ web_search({ queries: ["query 1", "query 2"], workflow: "auto-summary" })
 | `includeContent` | Fetch full page content from sources in background |
 | `workflow` | `none` (skip curator; fresh-install default), `summary-review` (open curator and auto-generate a summary draft), or `auto-summary` (generate a summary without opening the curator) |
 
-Batch searches run up to three queries concurrently. Provider routing and fallback within each query remain sequential.
+Batch searches run up to three queries concurrently. Provider routing and fallback within each query remain sequential. Successful searches return `details.responseId` for their stored search results; `details.searchId` remains an alias for the same ID. When `includeContent` fetches pages, `details.fetchId` is a separate ID for those pages.
 
 ### fetch_content
 
@@ -225,6 +225,8 @@ For a standing answer-mode model, set both `fetch.answerProvider` and `fetch.ans
 Thanks to [@linuxtextadventurer](https://github.com/linuxtextadventurer) for PR #328.
 
 ### get_search_content
+
+Pass `web_search`'s `details.responseId` (or the older `details.searchId` alias) as `responseId` with `query` or `queryIndex` to retrieve search results. For pages fetched by `web_search({ includeContent: true })`, pass `details.fetchId` as `responseId` with `url` or `urlIndex` once content is ready. `fetch_content` returns its own `details.responseId` when it stores content.
 
 Retrieve stored content from previous searches or fetches. Search provider answers and every result remain available in full and can be paged with `offset` and `limit` or searched with `findText`. Fetched URL content is stored in full in a private `web-search-cache` directory under the Pi config directory, not in the session JSONL. This includes `fetch_content` answer mode, which stores the original page content. The cache has a one-hour lifetime and fixed limits of 128 entries and 128 MiB; when either limit is reached, the oldest entries are removed first. On macOS and Linux the cache directory and files are kept at permissions `0700` and `0600`, respectively. Use `findText` to locate bounded matching passages without paging through a large page, or use `offset` and `limit` to retrieve slices intentionally.
 
