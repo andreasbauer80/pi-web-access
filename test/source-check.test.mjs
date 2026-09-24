@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import initializeExtension from "../index.ts";
+import initializeExtension, { formatSourceCheckResult } from "../index.ts";
 import {
   assessClaim,
   buildResearchArtifact,
@@ -9,6 +9,7 @@ import {
   getResearchArtifact,
   hashContent,
   storeResearchArtifact,
+  withClaimAssessment,
 } from "../source-check.ts";
 import { clearResults } from "../storage.ts";
 
@@ -234,4 +235,51 @@ test("page passages rank claim-matching sentences from deep in the page first, n
   assert.equal(pagePassages[0].text, `* ${target}`);
   assert.ok(pagePassages[0].extraction_span.start > 10_000);
   assert.equal(content.slice(pagePassages[0].extraction_span.start, pagePassages[0].extraction_span.end), pagePassages[0].text);
+});
+
+const passageLines = (text) => {
+  const section = text.split("## Passages\n")[1];
+  assert.ok(section, "missing ## Passages section");
+  return section.split("\n").filter((line) => line.startsWith("- ["));
+};
+
+test("source_check text lists passage text, page passages before the snippet", () => {
+  const intro = "This article explains the new features in Python 3.11, compared to 3.10.\n\n";
+  const filler = "Unrelated section text about the interpreter and its build options. ".repeat(200);
+  const target = "Added the asyncio.TaskGroup class, an asynchronous context manager holding a group of tasks.";
+  const content = `${intro}${filler}\n\n* ${target}\n\nMore unrelated tail text.`;
+  const claim = "asyncio.TaskGroup was added in Python 3.11";
+  const artifact = withClaimAssessment(buildResearchArtifact({
+    query: claim,
+    results: [result("https://docs.python.org/3/whatsnew/3.11.html", "This article explains the new features in Python 3.11, compared to 3.10.")],
+    fetched: [{ url: "https://docs.python.org/3/whatsnew/3.11.html", title: "What's New", content, error: null }],
+  }), [claim]);
+  const targetPassage = artifact.passages.find((passage) => passage.text === `* ${target}`);
+  assert.ok(targetPassage.extraction_span.start > 10_000);
+  const text = formatSourceCheckResult(artifact);
+  const lines = passageLines(text);
+  assert.equal(lines[0], `- [${targetPassage.passage_id}] (source 1) * ${target}`);
+  assert.ok(lines.length <= 2);
+  assert.match(text, new RegExp(`Artifact responseId: ${artifact.id} `));
+});
+
+test("source_check text caps passages at 2 per source and 10 in total", () => {
+  const longSnippet = `Streaming   responses\n\tare documented. ${"x".repeat(400)}`;
+  const results = [result("https://example.com/0", longSnippet, 1)];
+  const fetched = [];
+  for (let rank = 2; rank <= 6; rank++) {
+    const url = `https://example.com/${rank}`;
+    results.push(result(url, "Streaming responses snippet.", rank));
+    fetched.push({ url, title: "Example", content: "Streaming responses one. Streaming responses two. Streaming responses three.", error: null });
+  }
+  const artifact = buildResearchArtifact({ query: "streaming responses", results, fetched });
+  assert.ok(artifact.passages.length > 10);
+  const text = formatSourceCheckResult(artifact, "get_search_content");
+  const lines = passageLines(text);
+  assert.equal(lines.length, 10);
+  assert.equal(lines[0], `- [p-1-0] (source 1) ${`Streaming responses are documented. ${"x".repeat(400)}`.slice(0, 300)}…`);
+  assert.deepEqual(lines.slice(1, 3).map((line) => line.split(" ")[1]), ["[p-2-1]", "[p-2-2]"]);
+  assert.ok(!text.includes("[p-2-0]"));
+  assert.match(text, new RegExp(`Showing 10 of ${artifact.passages.length} passages\\. Full list: get_search_content with responseId ${artifact.id}\\.`));
+  assert.ok(text.trimEnd().endsWith(`Artifact responseId: ${artifact.id} (retrievable via get_search_content).`));
 });

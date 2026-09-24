@@ -731,7 +731,7 @@ function formatSearchSummary(results: SearchResult[], answer: string): string {
 	return output;
 }
 
-function formatSourceCheckResult(artifact: ResearchArtifact, getSearchContentTool: string | null = DEFAULT_TOOL_NAMES.getSearchContent): string {
+export function formatSourceCheckResult(artifact: ResearchArtifact, getSearchContentTool: string | null = DEFAULT_TOOL_NAMES.getSearchContent): string {
 	const assessment = artifact.claims?.[0];
 	const lines = [`# Source check: ${artifact.query}`, ""];
 	if (assessment) {
@@ -744,6 +744,27 @@ function formatSourceCheckResult(artifact: ResearchArtifact, getSearchContentToo
 	if (artifact.sources.length > 0) {
 		lines.push("## Sources");
 		for (const source of artifact.sources) lines.push(`${source.rank}. [${source.quality}] ${source.title}\n   ${source.url}`);
+		lines.push("");
+	}
+	if (artifact.passages.length > 0) {
+		// Show passage text inline so the model does not need a second call; page passages first, 2 per source, 10 total.
+		const shown: ResearchArtifact["passages"] = [];
+		for (const source of [...artifact.sources].sort((a, b) => a.rank - b.rank)) {
+			const own = artifact.passages.filter((passage) => passage.source_url === source.url);
+			const ordered = [...own.filter((passage) => passage.extraction_span), ...own.filter((passage) => !passage.extraction_span)];
+			shown.push(...ordered.slice(0, 2));
+		}
+		const capped = shown.slice(0, 10);
+		lines.push("## Passages");
+		for (const passage of capped) {
+			const text = passage.text.replace(/\s+/g, " ").trim();
+			lines.push(`- [${passage.passage_id}] (source ${passage.source_rank}) ${text.length > 300 ? `${text.slice(0, 300)}…` : text}`);
+		}
+		if (capped.length < artifact.passages.length) {
+			lines.push(getSearchContentTool
+				? `Showing ${capped.length} of ${artifact.passages.length} passages. Full list: ${getSearchContentTool} with responseId ${artifact.id}.`
+				: `Showing ${capped.length} of ${artifact.passages.length} passages. The full list is in artifact ${artifact.id}.`);
+		}
 		lines.push("");
 	}
 	if (artifact.errors?.length) lines.push(`Search errors: ${artifact.errors.map((entry) => `${entry.query}: ${entry.error}`).join("; ")}`);
