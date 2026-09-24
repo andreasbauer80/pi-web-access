@@ -121,17 +121,10 @@ function extractRelevantSpans(content: string, hint: string): Span[] {
 	}
 	const terms = tokenize(hint);
 	if (terms.length === 0) return [];
-	const lowered = sentences.map((sentence) => sentence.text.toLowerCase());
-	// Rank every sentence on the page by claim-term overlap; rarer terms break ties.
-	const frequency = new Map(terms.map((term) => [term, lowered.filter((text) => text.includes(term)).length]));
 	return sentences
-		.map((sentence, index) => {
-			const matched = terms.filter((term) => lowered[index].includes(term));
-			const rarity = matched.reduce((sum, term) => sum + 1 / (frequency.get(term) ?? 1), 0);
-			return { sentence, index, score: matched.length, rarity };
-		})
+		.map((sentence, index) => ({ sentence, index, score: terms.filter((term) => sentence.text.toLowerCase().includes(term)).length }))
 		.filter((item) => item.score > 0)
-		.sort((a, b) => b.score - a.score || b.rarity - a.rarity || a.index - b.index)
+		.sort((a, b) => b.score - a.score || a.index - b.index)
 		.slice(0, 3)
 		.map(({ sentence }) => sentence);
 }

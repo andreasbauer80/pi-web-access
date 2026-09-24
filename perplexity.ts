@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { stripTrailingOffer } from "./search-answer-formatting.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
@@ -193,7 +192,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 		throw new Error(`Perplexity API returned invalid JSON: ${message}`);
 	}
 
-	const answer = stripTrailingOffer((data.choices as Array<{ message?: { content?: string } }>)?.[0]?.message?.content || "");
+	const answer = (data.choices as Array<{ message?: { content?: string } }>)?.[0]?.message?.content || "";
 	const citations = Array.isArray(data.citations) ? data.citations : [];
 	// search_results carries page titles for the URLs listed in citations.
 	const titlesByUrl = new Map<string, string>();
