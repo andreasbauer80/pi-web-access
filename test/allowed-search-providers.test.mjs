@@ -261,7 +261,7 @@ test("source_check follows an allowed routing fallback", () => {
       throw new Error("disabled request " + url);
     };
     const tools = []; (await import(${JSON.stringify(indexUrl)})).default({ registerTool(t) { tools.push(t); }, registerCommand() {}, registerShortcut() {}, on() {}, appendEntry() {} });
-    const response = await tools.find(t => t.name === "source_check").execute("call", { claim: "q" }, undefined, undefined, { modelRegistry: {} });
+    const response = await tools.find(t => t.name === "source_check").execute("call", { claim: "q", fetchContent: false }, undefined, undefined, { modelRegistry: {} });
     console.log(JSON.stringify({ provider: response.details.artifact.provider, calls, errors: response.details.artifact.errors || [] }));
   `, { BRAVE_API_KEY: "b" });
   assert.equal(result.status, 0, result.stderr);

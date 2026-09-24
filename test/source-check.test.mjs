@@ -137,8 +137,9 @@ test("source_check executes a successful OpenAI provider response with runtime c
   const previousFetch = globalThis.fetch;
   const previousKey = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = "source-check-test-key";
+  const requested = [];
   globalThis.fetch = async (url) => {
-    assert.equal(String(url), "https://api.openai.com/v1/responses");
+    requested.push(String(url));
     return new Response(JSON.stringify({
       output: [
         { type: "web_search_call", action: { sources: [{ title: "API docs", url: "https://docs.example.com/api" }] } },
@@ -148,10 +149,44 @@ test("source_check executes a successful OpenAI provider response with runtime c
   };
   try {
     const { tool, entries } = registerSourceCheck();
-    const response = await tool.execute("call", { claim: "API supports streaming responses", provider: "openai" }, undefined, undefined, { modelRegistry: {} });
+    const response = await tool.execute("call", { claim: "API supports streaming responses", provider: "openai", fetchContent: false }, undefined, undefined, { modelRegistry: {} });
+    assert.deepEqual(requested, ["https://api.openai.com/v1/responses"]);
     assert.equal(response.details.sourceCount, 1);
     assert.equal(response.details.passageCount, 0);
     assert.equal(entries[0].type, "web-search-results");
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+  }
+});
+
+test("source_check fetches result pages by default and builds page passages", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "source-check-test-key";
+  const pageUrl = "https://93.184.216.34/api-docs";
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    requested.push(String(url));
+    if (String(url) === "https://api.openai.com/v1/responses") {
+      return new Response(JSON.stringify({
+        output: [
+          { type: "web_search_call", action: { sources: [{ title: "API docs", url: pageUrl }] } },
+          { type: "message", content: [{ type: "output_text", text: "" }] },
+        ],
+      }), { status: 200 });
+    }
+    return new Response("Overview.\n\nThe API supports streaming responses over server-sent events.\n", { status: 200, headers: { "content-type": "text/plain" } });
+  };
+  try {
+    const { tool } = registerSourceCheck();
+    const response = await tool.execute("call", { claim: "API supports streaming responses", provider: "openai" }, undefined, undefined, { modelRegistry: {} });
+    assert.ok(requested.includes(pageUrl), `page was not fetched: ${requested.join(", ")}`);
+    const pagePassages = response.details.artifact.passages.filter((passage) => passage.extraction_span);
+    assert.ok(pagePassages.length > 0, "no page passages were built");
+    assert.ok(pagePassages.some((passage) => passage.text.includes("supports streaming responses")));
+    assert.equal(response.details.artifact.claims[0].status, "unclear");
   } finally {
     globalThis.fetch = previousFetch;
     if (previousKey === undefined) delete process.env.OPENAI_API_KEY;

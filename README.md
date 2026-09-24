@@ -241,14 +241,14 @@ get_search_content({ responseId: "abc123", urlIndex: 0, findText: ["timeout", "r
 
 ### source_check
 
-Gather evidence for a claim and return a machine-readable artifact with exact passage citations for manual semantic review. Search results are deduplicated and capped at 20 sources; `fetchContent` fetches at most 5 pages, while stored and retrieved content remains subject to the configured `maxInlineContentChars` `offset`/`limit` bounds.
+Gather evidence for a claim and return a machine-readable artifact with exact passage citations for manual semantic review. Search results are deduplicated and capped at 20 sources; `fetchContent` (default `true`) fetches at most 5 result pages for exact passage extraction, and `fetchContent: false` gives a faster snippet-only check, while stored and retrieved content remains subject to the configured `maxInlineContentChars` `offset`/`limit` bounds.
 
 ```typescript
 source_check({ claim: "The API supports streaming responses" })
 source_check({
   claim: "The API supports streaming responses",
   queries: ["API streaming responses documentation", "API streaming limitations"],
-  fetchContent: true,
+  fetchContent: false,
   domainFilter: ["docs.example.com", "-old.example.com"]
 })
 ```

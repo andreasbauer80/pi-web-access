@@ -408,6 +408,8 @@ export interface ExtractOptions {
 	proxy?: string;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
+	/** Session that owns GitHub clones made by this call. */
+	sessionId?: string;
 }
 
 /** Resolve the direct HTTP/Jina fetch budget, with a per-call override taking precedence. */
@@ -778,7 +780,7 @@ export async function extractContent(
 	}
 
 	try {
-		const ghResult = await extractGitHub(url, signal, options?.forceClone);
+		const ghResult = await extractGitHub(url, signal, options?.forceClone, options?.sessionId);
 		if (ghResult) return ghResult;
 		if (signal?.aborted) return abortedResult(url);
 	} catch (err) {

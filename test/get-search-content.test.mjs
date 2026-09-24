@@ -286,6 +286,36 @@ test("get_search_content still requires a selector when the responseId has sever
 	assert.match(result.content[0].text, /1: https:\/\/example\.com\/two/);
 });
 
+test("get_search_content defaults to the only query when no selector is given", async () => {
+	const tool = getContentTool();
+	storeSearchContent();
+
+	const result = await tool.execute("call", { responseId: "search-result" });
+
+	assert.equal(result.details.error, undefined, result.content[0].text);
+	assert.equal(result.details.query, "CotEditor scripts");
+	assert.match(result.content[0].text, /ScriptManager\.swift/);
+});
+
+test("get_search_content still requires a selector when the responseId has several queries", async () => {
+	const tool = getContentTool();
+	storeResult("multi-search", {
+		id: "multi-search",
+		type: "search",
+		timestamp: Date.now(),
+		queries: [
+			{ query: "first query", answer: "", results: [], error: null },
+			{ query: "second query", answer: "", results: [], error: null },
+		],
+	});
+
+	const result = await tool.execute("call", { responseId: "multi-search" });
+
+	assert.equal(result.details.error, "No query specified");
+	assert.match(result.content[0].text, /Specify query or queryIndex/);
+	assert.match(result.content[0].text, /0: "first query", 1: "second query"/);
+});
+
 test("get_search_content finds bounded passages in stored fetched content", async () => {
 	const tool = getContentTool();
 	storeFetchedContent(`prefix ${"A".repeat(2_000)} Installation requires Node 22. ${"B".repeat(2_000)} suffix`);

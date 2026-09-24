@@ -9,7 +9,7 @@ import { resolveAuthFetchProfile, type AuthFetchProfile } from "./auth-fetch.ts"
 import { findContent, type FindMode } from "./content-find.ts";
 import { answerFromPage } from "./page-query.ts";
 import { rewriteSearchQuery } from "./query-rewrite.ts";
-import { clearCloneCache } from "./github-extract.ts";
+import { releaseSessionClones } from "./github-extract.ts";
 import { ALL_SEARCH_PROVIDERS, assertSearchProviderSelectionAllowed, getAllowedSearchProviders, getConfiguredSearchRouting, normalizeSearchProviderSelection, providerLabel, RESOLVED_SEARCH_PROVIDERS, search, type AttributedSearchResponse, type ProviderAvailability, type SearchProvider, type SearchProviderSelection, type ResolvedSearchProvider } from "./gemini-search.ts";
 export type { ProviderAvailability } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
@@ -116,11 +116,13 @@ function withRegisteredFetchOptions(
 	options: ExtractOptions | undefined,
 	toolNames: ExtractOptions["toolNames"],
 	proxy?: string,
+	sessionId?: string,
 ): ExtractOptions {
 	return {
 		...(options ?? {}),
 		toolNames,
 		...(proxy !== undefined ? { proxy } : {}),
+		...(sessionId !== undefined ? { sessionId } : {}),
 	};
 }
 
@@ -587,13 +589,12 @@ function resolveProvider(
 	return provider;
 }
 
-// Module state is shared by every session in the process; each fetch records its session.
+// Module state is shared by every session in the process; each fetch and curator records its session.
 const pendingFetches = new Map<string, { controller: AbortController; sessionId: string | undefined }>();
-let widgetVisible = false;
-let widgetUnsubscribe: (() => void) | null = null;
 const pendingCurates = new Map<string, PendingCurate>();
 const activeCurators = new Map<string, CuratorServerHandle>();
 const glimpseWins = new Map<string, GlimpseWindow>();
+const curatorOwners = new Map<string, string | undefined>();
 
 interface PendingCurate {
 	phase: "searching" | "curating";
@@ -841,31 +842,22 @@ function abortPendingFetches(sessionId: string): void {
 	}
 }
 
-function closeCurator(callId?: string): void {
-	if (callId !== undefined) {
-		const win = glimpseWins.get(callId);
-		glimpseWins.delete(callId);
-		try { win?.close(); } catch {}
-		pendingCurates.get(callId)?.cancel("stale");
-		pendingCurates.delete(callId);
-		const curator = activeCurators.get(callId);
-		activeCurators.delete(callId);
-		try { curator?.close(); } catch {}
-		return;
-	}
+function closeCurator(callId: string): void {
+	curatorOwners.delete(callId);
+	const win = glimpseWins.get(callId);
+	glimpseWins.delete(callId);
+	try { win?.close(); } catch {}
+	pendingCurates.get(callId)?.cancel("stale");
+	pendingCurates.delete(callId);
+	const curator = activeCurators.get(callId);
+	activeCurators.delete(callId);
+	try { curator?.close(); } catch {}
+}
 
-	for (const win of glimpseWins.values()) {
-		try { win.close(); } catch {}
+function closeSessionCurators(sessionId: string): void {
+	for (const [callId, owner] of curatorOwners) {
+		if (owner === sessionId) closeCurator(callId);
 	}
-	glimpseWins.clear();
-	for (const pc of pendingCurates.values()) {
-		try { pc.cancel("stale"); } catch {}
-	}
-	pendingCurates.clear();
-	for (const curator of activeCurators.values()) {
-		try { curator.close(); } catch {}
-	}
-	activeCurators.clear();
 }
 
 async function openInBrowser(pi: ExtensionAPI, url: string): Promise<void> {
@@ -1071,22 +1063,6 @@ function formatEntryLine(
 	return `${typeStr.padEnd(4)} ${target.padEnd(32)} ${statusStr.padStart(5)} ${duration.padStart(5)} ${indicator}`;
 }
 
-function handleSessionChange(ctx: ExtensionContext): void {
-	abortPendingFetches(getSessionOwnerId(ctx));
-	closeCurator();
-	clearCloneCache();
-	restoreFromSession(ctx);
-	// Unsubscribe before clear() to avoid callback with stale ctx
-	widgetUnsubscribe?.();
-	widgetUnsubscribe = null;
-	activityMonitor.clear();
-	if (widgetVisible) {
-		// Re-subscribe with new ctx
-		widgetUnsubscribe = activityMonitor.onUpdate(() => updateWidget(ctx));
-		updateWidget(ctx);
-	}
-}
-
 export default function (pi: ExtensionAPI) {
 	const initConfig = loadConfigForExtensionInit();
 	const fetchModeConfig = resolveFetchModeConfig(initConfig);
@@ -1128,6 +1104,25 @@ export default function (pi: ExtensionAPI) {
 	const activityKey = initConfig.shortcuts?.activity || DEFAULT_SHORTCUTS.activity;
 	// Session that owns this extension instance; set on session_start.
 	let sessionId: string | undefined;
+	let widgetVisible = false;
+	let widgetUnsubscribe: (() => void) | null = null;
+
+	function handleSessionChange(ctx: ExtensionContext): void {
+		const changedSessionId = getSessionOwnerId(ctx);
+		abortPendingFetches(changedSessionId);
+		closeSessionCurators(changedSessionId);
+		releaseSessionClones(changedSessionId);
+		restoreFromSession(ctx);
+		// Unsubscribe before clear() to avoid callback with stale ctx
+		widgetUnsubscribe?.();
+		widgetUnsubscribe = null;
+		activityMonitor.clear();
+		if (widgetVisible) {
+			// Re-subscribe with new ctx
+			widgetUnsubscribe = activityMonitor.onUpdate(() => updateWidget(ctx));
+			updateWidget(ctx);
+		}
+	}
 
 	function startBackgroundFetch(urls: string[], proxy?: string): string | null {
 		if (urls.length === 0) return null;
@@ -1135,7 +1130,7 @@ export default function (pi: ExtensionAPI) {
 		const controller = new AbortController();
 		pendingFetches.set(fetchId, { controller, sessionId });
 		Promise.resolve()
-			.then(() => runWithProxy(proxy, () => fetchAllContent(urls, controller.signal, withRegisteredFetchOptions(undefined, registeredToolNames, proxy))))
+			.then(() => runWithProxy(proxy, () => fetchAllContent(urls, controller.signal, withRegisteredFetchOptions(undefined, registeredToolNames, proxy, sessionId))))
 			.then((fetched) => {
 				if (!pendingFetches.has(fetchId)) return;
 				const data = {
@@ -1845,8 +1840,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		const endingSessionId = getSessionOwnerId(ctx);
 		abortPendingFetches(endingSessionId);
-		closeCurator();
-		clearCloneCache();
+		closeSessionCurators(endingSessionId);
+		releaseSessionClones(endingSessionId);
 		releaseSessionResults(endingSessionId);
 		// Unsubscribe before clear() to avoid callback with stale ctx
 		widgetUnsubscribe?.();
@@ -1999,6 +1994,7 @@ export default function (pi: ExtensionAPI) {
 
 				const onAbort = () => closeCurator(callId);
 				pendingCurates.set(callId, pc);
+				curatorOwners.set(callId, sessionId);
 				signal?.addEventListener("abort", onAbort, { once: true });
 				pc.browserPromise = openCuratorBrowser(callId, pc, ctx, false);
 
@@ -2465,7 +2461,7 @@ export default function (pi: ExtensionAPI) {
 			claim: Type.String({ description: "The assertion to gather web sources for." }),
 			queries: Type.Optional(Type.Array(Type.String(), { description: "Search queries (default: the claim)." })),
 			numResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Results per query (default: 5, max: 20)." })),
-			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction." })),
+			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction (default true; false gives a faster snippet-only check)." })),
 			recencyFilter: Type.Optional(StringEnum(["day", "week", "month", "year"], { description: "Filter by recency." })),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains; prefix with - to exclude." })),
 			provider: Type.Optional(searchProviderSchema(`Search provider or non-empty list of allowed providers to search simultaneously; ${allPolicyDescription}`, allowedSearchProviders)),
@@ -2521,10 +2517,10 @@ export default function (pi: ExtensionAPI) {
 
 				const results = [...resultsByUrl.values()].slice(0, 20).map((result, index) => ({ ...result, rank: index + 1 }));
 				let fetched: ExtractedContent[] = [];
-				if (params.fetchContent && results.length > 0) {
+				if (params.fetchContent !== false && results.length > 0) {
 					const urls = results.slice(0, 5).map((result) => result.url);
 					try {
-						fetched = await fetchAllContent(urls, signal, withRegisteredFetchOptions(undefined, registeredToolNames, typeof params.proxy === "string" ? params.proxy : undefined));
+						fetched = await fetchAllContent(urls, signal, withRegisteredFetchOptions(undefined, registeredToolNames, typeof params.proxy === "string" ? params.proxy : undefined, sessionId));
 					} catch (err) {
 						if (signal?.aborted || isAbortError(err)) throw err;
 						fetched = urls.map((url) => ({ url, title: "", content: "", error: err instanceof Error ? err.message : String(err) }));
@@ -2657,7 +2653,7 @@ export default function (pi: ExtensionAPI) {
 					...(mode === "answer" ? answerExtractionOptions : extractionOptions),
 					...(authFetchProfile ? { authFetchProfile } : {}),
 				};
-				const fetchResults = await fetchAllContent(urlList, signal, withRegisteredFetchOptions(fetchOptions, registeredToolNames, options.proxy));
+				const fetchResults = await fetchAllContent(urlList, signal, withRegisteredFetchOptions(fetchOptions, registeredToolNames, options.proxy, sessionId));
 				const presentedResults = mode === "answer"
 					? await Promise.all(fetchResults.map(async result => {
 						if (result.error) return result;
@@ -3035,6 +3031,8 @@ export default function (pi: ExtensionAPI) {
 							details: { error: "Index out of range" },
 						};
 					}
+				} else if (data.queries.length === 1) {
+					queryData = data.queries[0];
 				} else {
 					const available = data.queries.map((q, i) => `${i}: "${q.query}"`).join(", ");
 					return {
@@ -3489,6 +3487,7 @@ export default function (pi: ExtensionAPI) {
 
 				commandHandle = handle;
 				activeCurators.set(commandCallId, handle);
+				curatorOwners.set(commandCallId, sessionId);
 				let browserOpenError: string | null = null;
 				if (!shouldAutoOpenCuratorBrowser(loadConfig())) {
 					ctx.ui.notify(`Search curator is running. Open manually: ${handle.url}`, "info");

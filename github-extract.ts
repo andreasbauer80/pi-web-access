@@ -46,6 +46,8 @@ export interface GitHubUrlInfo {
 interface CachedClone {
 	destination: CloneDestination;
 	clonePromise: Promise<string | null>;
+	/** Sessions that use this clone; it is removed when the last one releases it. */
+	owners: Set<string>;
 }
 
 interface CloneDestination {
@@ -907,6 +909,7 @@ export async function extractGitHub(
 	url: string,
 	signal?: AbortSignal,
 	forceClone?: boolean,
+	sessionId?: string,
 ): Promise<ExtractedContent | null> {
 	const info = parseGitHubUrl(url);
 	if (!info) return null;
@@ -920,7 +923,10 @@ export async function extractGitHub(
 	const key = cacheKey(owner, repo, info.ref);
 
 	const cached = cloneCache.get(key);
-	if (cached) return awaitCachedClone(cached, url, owner, repo, info, signal);
+	if (cached) {
+		if (sessionId !== undefined) cached.owners.add(sessionId);
+		return awaitCachedClone(cached, url, owner, repo, info, signal);
+	}
 
 	if (info.refIsFullSha) {
 		if (signal?.aborted) return null;
@@ -966,6 +972,7 @@ export async function extractGitHub(
 	// Re-check: another concurrent caller may have started a clone while we awaited the size check
 	const cachedAfterSizeCheck = cloneCache.get(key);
 	if (cachedAfterSizeCheck) {
+		if (sessionId !== undefined) cachedAfterSizeCheck.owners.add(sessionId);
 		const cachedResult = await awaitCachedClone(cachedAfterSizeCheck, url, owner, repo, info, signal);
 		if (signal?.aborted) {
 			activityMonitor.logComplete(activityId, 0);
@@ -985,7 +992,7 @@ export async function extractGitHub(
 		return apiFallback;
 	}
 	const clonePromise = cloneRepo(owner, repo, info.ref, config, destination, signal);
-	cloneCache.set(key, { destination, clonePromise });
+	cloneCache.set(key, { destination, clonePromise, owners: new Set(sessionId === undefined ? [] : [sessionId]) });
 
 	const result = await clonePromise;
 	if (signal?.aborted) {
@@ -1015,6 +1022,21 @@ export async function extractGitHub(
 	const content = generateContent(result, info);
 	const title = info.path ? `${owner}/${repo} - ${info.path}` : `${owner}/${repo}`;
 	return { url, title, content, error: null };
+}
+
+/** Drop this session's claims; delete clones no session uses any more. */
+export function releaseSessionClones(sessionId: string): void {
+	for (const [key, entry] of cloneCache) {
+		if (!entry.owners.delete(sessionId) || entry.owners.size > 0) continue;
+		cloneCache.delete(key);
+		removeCloneDestination(entry.destination);
+	}
+	if (cloneCache.size > 0) return;
+	if (cloneRuntime) {
+		removeCloneRuntime(cloneRuntime.parentPath, cloneRuntime.rootPath);
+	}
+	cloneRuntime = null;
+	cachedConfig = null;
 }
 
 export function clearCloneCache(): void {
